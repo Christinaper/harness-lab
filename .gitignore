@@ -1,0 +1,6 @@
+.venv/
+.env
+sandbox/
+logs/
+__pycache__/
+*:Zone.Identifier
