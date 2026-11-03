@@ -1,13 +1,13 @@
-"""harness.py — 第 4 步:让 harness 自己不被工具搞垮(仍然只有一个 bash 工具)
+"""harness.py — 第 5 步:上下文管理(先量,再管)(仍然只有一个 bash 工具)
 
 累计功能:
     第 2 步  权限层:每条命令执行前由人确认;子进程不继承 DEEPSEEK_API_KEY
     第 3 步  记录层:实际发生的事写进 logs/*.jsonl(完整输出),结束时 harness 自己打印命令清单
-    第 4 步  健壮性:
-             a. 工具出错(输出解码失败、参数格式错、超时)一律变成"观察"回传给模型,
-                不让 harness 崩溃
-             b. 先记后做:命令一经批准就先写入日志和记录,再执行,执行中崩溃也不会漏记
-             c. 超时杀掉整个进程组,而不只是 shell(否则 find 之类的子进程会留在后台继续跑)
+    第 4 步  健壮性:工具出错一律变成"观察"回传;先记后做;超时杀整个进程组;用真正的 bash
+    第 5 步  上下文管理:
+             a. 量:每轮打印 token 用量(来自 API 返回的 usage),并累计
+             b. 管:工具输出回传给模型前,过长就只保留头和尾,完整输出仍在日志里
+             c. 告知:把命令超时、输出上限写进工具描述,模型不必靠撞墙才知道
 
 运行:
     pip install openai
@@ -15,8 +15,11 @@
     mkdir sandbox && cd sandbox          # 务必在一个一次性目录里跑
     python ../harness.py "创建 hello.py,打印 hello,然后运行它"
 
+做对照实验(同一个任务,取消截断,看 token 差多少):
+    HARNESS_MAX_OUTPUT=100000000 python ../harness.py "..."
+
 整个 harness 就是 main() 里的那个 for 循环:
-    模型决定 -> (人确认) -> (先记) -> 执行工具 -> (再记) -> 把结果放回消息 -> 再让模型决定
+    模型决定 -> (人确认) -> (先记) -> 执行工具 -> (截断) -> (再记) -> 把结果放回消息 -> 再让模型决定
 """
 import datetime
 import json
@@ -32,14 +35,20 @@ MODEL = "deepseek-v4-flash"   # 若报模型不存在,去 DeepSeek 文档确认�
 SAFE_ENV = {k: v for k, v in os.environ.items() if k != "DEEPSEEK_API_KEY"}
 MAX_STEPS = 20                # 最简单的"刹车":防止模型无限循环烧钱
 TIMEOUT = 30                  # 单条命令的最长运行秒数
+MAX_OUTPUT = int(os.environ.get("HARNESS_MAX_OUTPUT", "8000"))   # 回传给模型的单条工具输出上限(字符)
 LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
 
-# 告诉模型有哪些工具。模型只能"请求"调用,真正执行的是下面的 run_bash。
+# 告诉模型有哪些工具,以及它们的限制。模型只能"请求"调用,真正执行的是下面的 run_bash。
 TOOLS = [{
     "type": "function",
     "function": {
         "name": "bash",
-        "description": "在当前目录执行一条 bash 命令,返回退出码、stdout 和 stderr。",
+        "description": (
+            "在当前目录执行一条 bash 命令,返回退出码、stdout 和 stderr。"
+            f"单条命令最多运行 {TIMEOUT} 秒,超时会被终止。"
+            f"输出超过 {MAX_OUTPUT} 字符时只保留开头和结尾,"
+            "所以输出可能很多时,请先用 head/tail/grep/wc 缩小范围。"
+        ),
         "parameters": {
             "type": "object",
             "properties": {"command": {"type": "string", "description": "要执行的命令"}},
@@ -56,7 +65,8 @@ SYSTEM = (
 
 _auto_approve = False
 _log_file = None
-_executed = []   # [(command, 是否被允许执行)],供结束时的 harness 记录使用
+_executed = []                                # [(command, 是否被允许执行)],供结束时的 harness 记录使用
+_usage = {"prompt": 0, "completion": 0}       # 累计 token 用量
 
 
 def log(event: dict) -> None:
@@ -64,6 +74,28 @@ def log(event: dict) -> None:
     if _log_file:
         with open(_log_file, "a", encoding="utf-8") as f:
             f.write(json.dumps(event, ensure_ascii=False) + "\n")
+
+
+def usage_of(resp) -> dict:
+    """取出 API 返回的用量;取不到就返回空,不影响主流程。"""
+    u = getattr(resp, "usage", None)
+    if u is None:
+        return {}
+    if hasattr(u, "model_dump"):
+        return u.model_dump()
+    return dict(vars(u))
+
+
+def clip(output: str) -> str:
+    """输出过长时只保留头和尾,中间用一句说明替代(完整输出仍在日志里)。
+    为什么留头和尾:开头通常交代了上下文,报错和最终结果通常在结尾。"""
+    if len(output) <= MAX_OUTPUT:
+        return output
+    half = MAX_OUTPUT // 2
+    cut = len(output) - 2 * half
+    return (output[:half]
+            + f"\n...[已截断中间 {cut} 个字符;请用 grep/head/tail/wc 缩小范围再看]...\n"
+            + output[-half:])
 
 
 def print_report() -> None:
@@ -75,6 +107,9 @@ def print_report() -> None:
         print("  ✔ " + c[:120].replace("\n", " ⏎ "))
     for c in denied:
         print("  ✘ " + c[:120].replace("\n", " ⏎ "))
+    if _usage["prompt"]:
+        # 每一轮都会把整个历史重新发一遍,所以"累计输入"远大于"上下文大小"
+        print(f"  累计输入 {_usage['prompt']} / 输出 {_usage['completion']} tokens")
 
 
 def ask_permission(command: str) -> bool:
@@ -130,7 +165,7 @@ def main(task: str) -> None:
     client = OpenAI(api_key=os.environ["DEEPSEEK_API_KEY"], base_url="https://api.deepseek.com")
     os.makedirs(LOG_DIR, exist_ok=True)
     _log_file = os.path.join(LOG_DIR, datetime.datetime.now().strftime("run-%Y%m%d-%H%M%S-%f.jsonl"))
-    log({"event": "task", "task": task, "model": MODEL})
+    log({"event": "task", "task": task, "model": MODEL, "max_output": MAX_OUTPUT})
     print(f"[日志] {_log_file}")
 
     messages = [
@@ -150,6 +185,13 @@ def main(task: str) -> None:
             )
             msg = resp.choices[0].message
 
+            usage = usage_of(resp)
+            p_tok, c_tok = usage.get("prompt_tokens"), usage.get("completion_tokens")
+            if p_tok is not None:
+                _usage["prompt"] += p_tok
+                _usage["completion"] += c_tok or 0
+                print(f"[第 {step + 1} 轮] 输入 {p_tok} / 输出 {c_tok} tokens")
+
             # 把模型这一轮的输出原样记入历史,下一轮它才"记得"自己做过什么
             entry = {"role": "assistant", "content": msg.content or ""}
             if msg.tool_calls:
@@ -160,7 +202,7 @@ def main(task: str) -> None:
                 ]
             messages.append(entry)
             log({"event": "assistant", "step": step + 1, "content": entry["content"],
-                 "tool_calls": entry.get("tool_calls", [])})
+                 "tool_calls": entry.get("tool_calls", []), "usage": usage})
 
             # 没有工具调用 = 模型认为做完了
             if not msg.tool_calls:
@@ -194,13 +236,19 @@ def main(task: str) -> None:
                     # 被拒绝也要作为"观察"回传,模型才知道要换条路,而不是卡住
                     output = ("denied: the user refused to run this command. "
                               "Do not retry it; try a different approach or explain.")
-                log({"event": "tool_result", "step": step + 1, "output": output})  # 日志里是完整输出
+                model_output = clip(output)   # 模型看到的(可能被截断)
+                log({"event": "tool_result", "step": step + 1,
+                     "output": output,                           # 日志里是完整输出
+                     "sent_to_model_chars": len(model_output)})
 
                 shown = output[:500]
                 if len(output) > 500:
-                    shown += f"\n…(屏幕只显示前 500 字符,完整输出共 {len(output)} 字符,见日志)"
-                print(shown)   # 回传给模型的是完整输出
-                messages.append({"role": "tool", "tool_call_id": c.id, "content": output})
+                    note = f"完整输出共 {len(output)} 字符,见日志"
+                    if len(model_output) < len(output):
+                        note += f";回传给模型时已截断为 {len(model_output)} 字符"
+                    shown += f"\n…(屏幕只显示前 500 字符;{note})"
+                print(shown)
+                messages.append({"role": "tool", "tool_call_id": c.id, "content": model_output})
 
         print(f"\n[达到 {MAX_STEPS} 轮上限,强制停止]")
     finally:
